@@ -1,16 +1,19 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
-from __future__ import with_statement, print_function
+from __future__ import with_statement, print_function, absolute_import
 
-import itertools
 import zipfile
 import os
-import httplib
-import urllib
 import datetime
+import io
 
 import xml.etree.cElementTree as et
-import cStringIO as StringIO
+
+import requests
+
+from .utils import sanitize, xor
+from .exceptions import ErrorUrlMissing
+from .exceptions import ResponseUrlMissing
+from .exceptions import AmountGreaterThanZero
 
 
 class Gateway(object):
@@ -36,38 +39,24 @@ class Gateway(object):
 
     """
 
-    FILTER_CHARS = ['~','`','!','#','$','%','^','|','\\',':',"'",'"','/']
-
     def __init__(self, resource_file, alias, currency=414, lang='ENG'):
         self.resource_file = resource_file
-        self.alias = alias+".xml"
+        self.alias = alias + ".xml"
         self.node_titles = (('id', ''), ('password', ''), ('webaddress', ''), ('port', 443), ('context', ''),
                             ('passwordhash', ''), )
         self.gw = dict(self.node_titles)
-        
+
         self._udf = {}
         self._amount = 1.0
         self._currency = currency
-    
+
         self._action = 1  # 1 = Pay, other actions (such as refunds)
-                          # not yet implemented
+        # not yet implemented
 
         self._response_url = None
         self._error_url = None
         self._trackid = None
         self._lang = lang
-
-    @staticmethod
-    def sanitize(s):
-        """Filter out characters not allowed in the tracking id or the UDF values"""
-        return s.translate(None, ''.join(FILTER_CHARS))
-
-    @staticmethod
-    def _xor(cryptext=None):
-        key = "Those who profess to favour freedom and yet depreciate agitation are men who want rain without thunder "
-        key += "and lightning"
-        key = itertools.cycle(key)
-        return ''.join(chr(ord(x) ^ ord(y)) for x, y in itertools.izip(cryptext, key))
 
     @property
     def udf(self):
@@ -77,16 +66,16 @@ class Gateway(object):
     def udf(self, value):
         """Sets the UDF dictionary, and filters out the restricted characters"""
         try:
-            if len(value.keys()) > 5:
+            if len(list(value.keys())) > 5:
                 raise ValueError('Only 5 user defined fields (UDF) are allowed')
-            if not all(x[:3].upper() == 'UDF' and 0 < int(x[-1]) <= 5 for x in value.keys()):
+            if not all(x[:3].upper() == 'UDF' and 0 < int(x[-1]) <= 5 for x in list(value.keys())):
                 raise ValueError('Dictionary keys must be in the form of UDF1 through UDF5')
-            self._udf.update({k.upper():sanitize(v) for k,v in value.iteritems()})
+            self._udf.update({k.upper(): sanitize(str(v)) for k, v in list(value.items())})
         except AttributeError:
             # Passed value does not have a keys() method,
             # assume its not a dictionary
-            self._udf.update({'UDF{}'.format(k+1):sanitize(v) for k,v in enumerate(value)})
-        
+            self._udf.update({'UDF{}'.format(k + 1): sanitize(str(v)) for k, v in enumerate(value)})
+
     @property
     def error_url(self):
         return self._error_url
@@ -101,9 +90,11 @@ class Gateway(object):
 
     @amount.setter
     def amount(self, value):
+        if not value:
+            raise AmountGreaterThanZero
         value = float(value)
         if value < 1:
-            raise ValueError('Minimum amount is 1.0')
+            raise AmountGreaterThanZero
         else:
             self._amount = value
 
@@ -124,10 +115,10 @@ class Gateway(object):
         self._response_url = value
 
     def _parse(self):
-        out = StringIO.StringIO()
+        out = io.BytesIO()
 
-        with open(self.resource_file, 'r') as f:
-            out.write(self._xor(''.join(chr(ord(x)) for x in f.read())))
+        with io.open(self.resource_file, mode='rb') as f:
+            out.write(xor(bytearray(f.read())))
 
         try:
             temp = zipfile.ZipFile(out)
@@ -135,26 +126,29 @@ class Gateway(object):
             raise zipfile.BadZipfile
 
         if self.alias in temp.namelist():
-            gw_info = self._xor(''.join(f for f in temp.read(self.alias)))
+            gw_info = xor(bytearray(temp.read(self.alias)))
         else:
-            raise ValueError('Invalid alias {0} for resource file {1}'.format(self.alias,
-                                                                             os.path.basename(self.resource_file)))
-        for node in et.fromstring(gw_info):
+            raise ValueError('Invalid alias {0} for resource file {1}, {2}'.format(self.alias,
+                                                                              os.path.basename(self.resource_file),
+                                                                              temp.namelist()))
+        # PY 3
+        try:
+            xml = et.fromstring(gw_info)
+        except TypeError:
+            xml = et.fromstring(str(gw_info))
+
+        for node in xml:
             if node.tag in self.gw:
                 self.gw[node.tag] = node.text or ''
 
     def _connect(self, params, transaction_type=1):
 
-        params = urllib.urlencode(params)
-
-        if int(self.gw['port']) == httplib.HTTPS_PORT:
-            conn = httplib.HTTPSConnection(self.gw['webaddress'], httplib.HTTPS_PORT)
+        if int(self.gw['port']) == 443:
+            scheme = 'https://{}'.format(self.gw['webaddress'])
         else:
-            conn = httplib.HTTPConnection(self.gw['webaddress'], httplib.HTTP_PORT)
+            scheme = 'http://{}'.format(self.gw['webaddress'])
 
-        conn.connect()
-
-        context = self.gw['context'] if self.gw['context'][-1] == '/' else self.gw['context']+'/'
+        context = self.gw['context'] if self.gw['context'][-1] == '/' else self.gw['context'] + '/'
 
         if transaction_type == 1:
             # Initialize a transaction
@@ -163,21 +157,15 @@ class Gateway(object):
             # Conduct payment
             url = '/{}servlet/PaymentTranHTTPServlet'.format(context)
 
-        headers = {'Content-type': 'application/x-www-form-urlencoded', 'Accept': 'text/plain'}
-        conn.request('POST', url, params, headers)
+        r = requests.post('{}{}'.format(scheme, url), data=params)
+        r.raise_for_status()
 
-        data = conn.getresponse().read()
+        data = r.text
 
-        # A rudimentary check to see if the gw is functional
-        if ':' not in data:
-            raise Exception('Invalid data returned: {}'.format(data))
-
-        print(data)
         result = data.split(':', 2)
         info = dict()
         info['paymentID'] = result[0] or None
-        info['paymentURL'] = result[1]+result[2] or None
-
+        info['paymentURL'] = '{}:{}'.format(result[1], result[2]) or None
         return info
 
     def get_payment_url(self):
@@ -194,12 +182,12 @@ class Gateway(object):
 
         # Configuration checks
 
-        if not self._amount:
-            raise ValueError('Amount must be specified.')
+        # if not self._amount:
+        #     raise AmountMissing()
         if not self._error_url:
-            raise ValueError('error_url is not set.')
+            raise ErrorUrlMissing()
         if not self._response_url:
-            raise ValueError('response_url is not set.')
+            raise ResponseUrlMissing()
         if not self._trackid:
             # No tracking id provided, generate one
             # using the time stamp
